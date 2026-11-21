@@ -106,9 +106,9 @@ scheduler:
 
 observability:
   log_retention_days: 14
-  alarm_emails: ["ops@example.com"]  # placeholder: the operator replaces it
+  alarm_emails: ["srinclan@arcamo.org"]
   access_log_expiration_days: 90
 
 cicd:
-  github_owner: example-owner  # placeholder: the GitHub organization or user that owns this repository
+  github_owner: Arcamo
   github_repo: tokenization-infra
