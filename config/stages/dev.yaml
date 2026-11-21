@@ -1,6 +1,6 @@
 stage: dev
 project: tokenization
-account: "000000000000"  # placeholder: the operator replaces it; the deploy workflow checks it against the caller identity
+account: "862307432587"
 region: us-east-1
 removal_policy: DESTROY
 
