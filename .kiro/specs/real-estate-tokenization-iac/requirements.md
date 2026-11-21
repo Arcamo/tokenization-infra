@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This document specifies spec 1 of the Infrastructure as Code (IaC) for the "Tokenización Inmobiliaria: arquitectura en AWS (MVP)" architecture. Spec 1 covers the minimal infrastructure needed to run the backend services and one front end. The IaC is written in AWS CDK v2 (Python) and provisions networking (VPC, private subnets, NAT gateways for egress to the Stellar network, the Stellar Anchor and KYC providers, VPC endpoints), encryption keys and secrets (KMS, Secrets Manager), identity (Cognito), one front end on Amplify Hosting (the investor/seller portal), the API layer (API Gateway), compute (.NET Lambda domains and a KMS signer Lambda in private subnets), data stores (RDS PostgreSQL behind RDS Proxy, DynamoDB, S3), orchestration and messaging (Step Functions, EventBridge, EventBridge Scheduler, SQS), and the minimal observability needed to operate (log retention, X-Ray, DLQ alarms). CI/CD runs on GitHub Actions.
+This document specifies spec 1 of the Infrastructure as Code (IaC) for the "Tokenización Inmobiliaria: arquitectura en AWS (MVP)" architecture. Spec 1 covers the minimal infrastructure needed to run the backend services and one front end. The IaC is written in AWS CDK v2 (Python) and provisions networking (VPC, private subnets, NAT gateways for egress to the Stellar network, the Stellar Anchor and KYC providers, VPC endpoints), encryption keys and secrets (KMS, Secrets Manager), identity (Cognito) with the sign-in and API settings for one front end (the investor/seller portal, hosted on an Amplify Hosting app created by hand), the API layer (API Gateway), compute (.NET Lambda domains and a KMS signer Lambda in private subnets), data stores (RDS PostgreSQL behind RDS Proxy, DynamoDB, S3), orchestration and messaging (Step Functions, EventBridge, EventBridge Scheduler, SQS), and the minimal observability needed to operate (log retention, X-Ray, DLQ alarms). CI/CD runs on GitHub Actions.
 
 The architecture is split into several specs. Later specs (for example the planned `tokenization-agentcore-iac` spec) build on the resources of spec 1 through published extension parameters. Items removed from this spec are listed in the section "Deferred to Later Specs".
 
@@ -17,6 +17,7 @@ The repository contains infrastructure only. Lambda code packages are built in a
 - A5: The Signing_Key uses the KMS key spec `ECC_NIST_EDWARDS25519` (Ed25519), which matches the Stellar account key type.
 - A6: The IaC avoids CloudFormation custom resources. CDK feature flags and construct options that add custom resources (for example `@aws-cdk/aws-ec2:restrictDefaultSecurityGroup`, Lambda `log_retention`, S3 `auto_delete_objects`) stay disabled unless a documented decision justifies them.
 - A7: Application-level behavior (business logic, Stellar transaction construction, KYC provider integration code, front-end code) is out of scope.
+- A8: Amplify Hosting apps (the Portal_App now, and the Stellar agent UI and backoffice apps later) are created and configured by hand, outside the IaC_App. This covers the app, branch, SPA rewrite rule, repository connection, custom domain and environment variables. The IaC_App creates no Amplify resources. It reads the Portal_Origin from Stage_Config and publishes the values the front end needs as Extension_Parameters.
 
 ## Glossary
 
@@ -29,8 +30,8 @@ The repository contains infrastructure only. Lambda code packages are built in a
 - **Private_Subnet**: A VPC subnet with egress only through a NAT gateway and no direct inbound internet route.
 - **Isolated_Subnet**: A VPC subnet with no route to the internet, used for the Database.
 - **Lambda_Security_Group**: The security group attached to every Domain_Lambda and the Signer_Lambda.
-- **Portal_App**: The single Amplify Hosting single-page application for investors and sellers.
-- **Portal_Origin**: The HTTPS origin of the Portal_App, which is the custom domain when Stage_Config defines one and the Amplify default domain of the configured branch otherwise.
+- **Portal_App**: The single Amplify Hosting single-page application for investors and sellers. It is created and configured by hand, outside the IaC_App (A8).
+- **Portal_Origin**: The HTTPS origin of the Portal_App, defined in Stage_Config. It is the Amplify default branch domain (for example `https://main.d1abc2def3.amplifyapp.com`) or a custom domain attached to the Portal_App by hand.
 - **User_Pool**: The Amazon Cognito user pool.
 - **Portal_Client**: The User_Pool app client used by the Portal_App.
 - **Resource_Server**: The User_Pool resource server that defines the custom OAuth scopes for the Api.
@@ -69,16 +70,16 @@ The repository contains infrastructure only. Lambda code packages are built in a
 #### Acceptance Criteria
 
 1. THE IaC_App SHALL be an AWS CDK v2 application written in Python 3.12 or later, with dependencies pinned in a uv lock file, type-checked by the Pipeline with mypy in strict mode or pyright, and linted by the Pipeline with ruff.
-2. THE IaC_App SHALL read account, region, the explicit list of Availability Zones, NAT gateway count, Artifact_References, custom domain settings, sizing values and removal policy from Stage_Config.
+2. THE IaC_App SHALL read account, region, the explicit list of Availability Zones, NAT gateway count, Artifact_References, the Portal_Origin, sizing values and removal policy from Stage_Config.
 3. THE IaC_App SHALL define a Stage_Config entry for the `dev` Stage.
 4. WHEN a Stage name is supplied through the CDK context key `stage`, THE IaC_App SHALL synthesize the stacks for the matching Stage_Config entry.
 5. IF the supplied Stage name has no matching Stage_Config entry, THEN THE IaC_App SHALL fail synthesis with an error message naming the unknown Stage.
 6. IF a required Stage_Config field is missing or invalid, THEN THE IaC_App SHALL fail synthesis with an error message naming the field.
 7. WHERE a Stage_Config entry omits the region, THE IaC_App SHALL use `us-east-1`.
 8. WHERE a Stage_Config entry defines a region, THE IaC_App SHALL deploy every stack of that Stage to the defined region.
-9. THE IaC_App SHALL include the Stage name as a prefix or path segment in every stack name and every name of a named resource, except SSM parameter names under `/{project}/{stage}/`, KMS alias names under `alias/`, log group names under `/aws/` paths or fixed by API Gateway (`API-Gateway-Execution-Logs_{restApiId}/{stage}`), User_Pool group names, the Resource_Server identifier and the Amplify branch name.
+9. THE IaC_App SHALL include the Stage name as a prefix or path segment in every stack name and every name of a named resource, except SSM parameter names under `/{project}/{stage}/`, KMS alias names under `alias/`, log group names under `/aws/` paths or fixed by API Gateway (`API-Gateway-Execution-Logs_{restApiId}/{stage}`), User_Pool group names and the Resource_Server identifier.
 10. THE IaC_App SHALL apply the tags `project`, `stage` and `managed-by=cdk` to every taggable resource.
-11. THE IaC_App SHALL split resources into separate stacks for network, security and keys, data, messaging and orchestration, API and compute, identity and front end, portal branch (deployed after the API and compute stack), and observability, and SHALL define the Bootstrap_Stack of Requirement 13.5 in a separate CDK app.
+11. THE IaC_App SHALL split resources into separate stacks for network, security and keys, data, messaging and orchestration, API and compute, identity, and observability, and SHALL define the Bootstrap_Stack of Requirement 13.5 in a separate CDK app.
 12. THE IaC_App SHALL synthesize templates that contain no resources of type `AWS::CloudFormation::CustomResource` or `Custom::*`, except resources listed in a documented allowlist with a justification.
 13. THE IaC_App SHALL keep the CDK feature flag `@aws-cdk/aws-ec2:restrictDefaultSecurityGroup` disabled.
 
@@ -114,9 +115,9 @@ The repository contains infrastructure only. Lambda code packages are built in a
 6. THE IaC_App SHALL grant `secretsmanager:GetSecretValue` on Kyc_Secrets only to the Stellar_KYC Domain_Lambda execution role.
 7. THE IaC_App SHALL apply a `RETAIN` removal policy to the Signing_Key and the Data_Key in every Stage.
 
-### Requirement 4: Identity and front-end hosting
+### Requirement 4: Identity and front-end settings
 
-**User Story:** As a product owner, I want investors and sellers to sign in through Cognito and use one portal hosted on Amplify, so that the backend services can be exercised end to end through a real front end.
+**User Story:** As a product owner, I want investors and sellers to sign in through Cognito and use one portal hosted on an Amplify app created by hand, so that the backend services can be exercised end to end through a real front end.
 
 #### Acceptance Criteria
 
@@ -128,11 +129,9 @@ The repository contains infrastructure only. Lambda code packages are built in a
 6. THE IaC_App SHALL configure the Portal_Client callback URLs and logout URLs as the Portal_Origin combined with the callback path and logout path defined in Stage_Config.
 7. WHERE Stage_Config lists additional local development callback URLs, THE IaC_App SHALL add those URLs to the Portal_Client callback URLs, and add the origin of each of those URLs combined with the logout path defined in Stage_Config to the Portal_Client logout URLs.
 8. THE IaC_App SHALL create a User_Pool hosted UI domain with the prefix defined in Stage_Config.
-9. THE IaC_App SHALL create exactly one Amplify Hosting app, the Portal_App, with a branch whose name is defined in Stage_Config.
-10. THE IaC_App SHALL configure the Portal_App with a rewrite rule that returns `/index.html` with status 200 for every request path that does not reference a static file extension.
-11. THE IaC_App SHALL set Portal_App environment variables containing the User_Pool ID, the Portal_Client ID, the hosted UI domain, the AWS region and the Api base URL.
-12. WHERE Stage_Config provides a source repository and the name of a Secrets Manager secret holding the repository access token, THE IaC_App SHALL connect the Portal_App branch to that repository.
-13. WHERE Stage_Config provides a custom domain, THE IaC_App SHALL associate the custom domain with the Portal_App branch.
+9. THE IaC_App SHALL read the Portal_Origin from Stage_Config.
+10. IF the Portal_Origin in Stage_Config is not an `https` origin without a path, query or fragment, THEN THE IaC_App SHALL fail synthesis with an error message naming the field.
+11. THE IaC_App SHALL create no Amplify Hosting resources (A8).
 
 ### Requirement 5: API layer
 
@@ -231,7 +230,7 @@ The repository contains infrastructure only. Lambda code packages are built in a
 1. THE IaC_App SHALL publish Extension_Parameters under the path prefix `/{project}/{stage}/` with the project name defined in Stage_Config.
 2. THE IaC_App SHALL publish Extension_Parameters for the VPC ID, the Private_Subnet IDs, the Isolated_Subnet IDs and the Lambda_Security_Group ID.
 3. THE IaC_App SHALL publish Extension_Parameters for the Api ID, the Api root resource ID and the Api base URL.
-4. THE IaC_App SHALL publish Extension_Parameters for the User_Pool ID, the User_Pool ARN and the Resource_Server identifier.
+4. THE IaC_App SHALL publish Extension_Parameters for the User_Pool ID, the User_Pool ARN, the Resource_Server identifier, the Portal_Client ID and the hosted UI domain, so that operators can set the Portal_App environment variables by hand.
 5. THE IaC_App SHALL publish Extension_Parameters for the Data_Key ARN and the Signing_Key ARN.
 6. THE IaC_App SHALL publish Extension_Parameters for the Event_Bus name and the Event_Bus ARN.
 7. THE IaC_App SHALL publish Extension_Parameters for the Alert_Topic ARN.
@@ -245,7 +244,7 @@ The repository contains infrastructure only. Lambda code packages are built in a
 1. THE IaC_App SHALL include pytest unit tests using the `aws_cdk.assertions` module that verify the resources required by Requirements 2 through 11 exist in the synthesized templates.
 2. THE IaC_App SHALL include tests that verify every S3 bucket blocks public access and every Domain_Lambda and the Signer_Lambda run in the Private_Subnets.
 3. THE IaC_App SHALL include a test that verifies `kms:Sign` on the Signing_Key appears only in the Signer_Lambda execution role policy.
-4. THE IaC_App SHALL include a test that verifies the synthesized templates contain exactly one Amplify Hosting app.
+4. THE IaC_App SHALL include a test that verifies the synthesized templates contain no `AWS::Amplify::*` resources.
 5. THE IaC_App SHALL include a test that verifies the synthesized templates contain no custom resources outside the documented allowlist.
 6. THE IaC_App SHALL run `AwsSolutionsChecks` from the `cdk-nag` Python package during synthesis.
 7. IF cdk-nag reports an error that has no documented suppression with a reason, THEN THE IaC_App SHALL fail synthesis.
@@ -276,6 +275,7 @@ The repository contains infrastructure only. Lambda code packages are built in a
 3. THE IaC_App README SHALL list the post-deployment manual steps, including populating Kyc_Secrets values and confirming Alert_Topic email subscriptions.
 4. THE IaC_App README SHALL list the Extension_Parameters with their names and meanings.
 5. THE IaC_App README SHALL list the items in the section "Deferred to Later Specs" of this document.
+6. THE IaC_App README SHALL describe the manual Portal_App setup: creating the Amplify app and branch before the first deployment, recording the Portal_Origin in Stage_Config, adding the SPA rewrite rule, and setting the environment variables from the Extension_Parameters after deployment.
 
 ## Deferred to Later Specs
 
@@ -288,7 +288,7 @@ The following items were part of the original full-architecture spec and are out
 - Bedrock AgentCore Gateway exposing Api operations as agent tools, with inbound authorization against the User_Pool.
 - The AgentCore DynamoDB table.
 - A Cognito machine-to-machine app client (client credentials grant) for the AgentCore Gateway.
-- The Stellar agent UI Amplify Hosting app and the `stellar-agent` User_Pool group.
+- The Cognito settings for the Stellar agent UI and the `stellar-agent` User_Pool group. The Stellar agent UI Amplify Hosting app itself is created by hand (A8).
 
 ### Undecided or later
 
@@ -297,5 +297,5 @@ The following items were part of the original full-architecture spec and are out
 - Analytics and audit pipeline: Kinesis data stream, Kinesis Data Firehose, analytics S3 bucket, Glue database and table, Athena workgroup, and the related Domain_Lambda and Reports grants.
 - AWS CloudTrail trail and Documents_Bucket data events.
 - CloudWatch dashboard and alarms beyond DLQ alarms (Lambda errors and throttles, Api 5XX, Saga_State_Machine failures, Database CPU).
-- The backoffice Amplify Hosting app.
+- The Cognito and API settings for the backoffice front end. Its Amplify Hosting app is created by hand (A8).
 - Cognito advanced security features (threat protection).

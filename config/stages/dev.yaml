@@ -1,0 +1,114 @@
+stage: dev
+project: tokenization
+account: "000000000000"  # placeholder: the operator replaces it; the deploy workflow checks it against the caller identity
+region: us-east-1
+removal_policy: DESTROY
+
+network:
+  nat_gateways: 1
+  cidr: 10.40.0.0/16
+  availability_zones: [us-east-1a, us-east-1b]
+
+lambda_runtime: dotnet8
+lambda_architecture: arm64
+
+functions:
+  collateral-identity:
+    artifact: { bucket: tokenization-artifacts-dev, key: lambdas/collateral-identity/1.0.0.zip }
+    handler: CollateralIdentity::CollateralIdentity.Function::Handler
+    memory_mb: 512
+    timeout_seconds: 29
+    uses_database: true
+    data_access: [idempotency-table, documents-bucket]
+  sagas-payments:
+    artifact: { bucket: tokenization-artifacts-dev, key: lambdas/sagas-payments/1.0.0.zip }
+    handler: SagasPayments::SagasPayments.Function::Handler
+    memory_mb: 512
+    timeout_seconds: 29
+    uses_database: true
+    data_access: [idempotency-table, saga-table]
+  reports:
+    artifact: { bucket: tokenization-artifacts-dev, key: lambdas/reports/1.0.0.zip }
+    handler: Reports::Reports.Function::Handler
+    memory_mb: 512
+    timeout_seconds: 29
+    uses_database: true
+    data_access: [documents-bucket]
+  stellar-kyc:
+    artifact: { bucket: tokenization-artifacts-dev, key: lambdas/stellar-kyc/1.0.0.zip }
+    handler: StellarKyc::StellarKyc.Function::Handler
+    memory_mb: 1024
+    timeout_seconds: 29
+    uses_database: true
+    data_access: [idempotency-table, documents-bucket]
+  trading-operations:
+    artifact: { bucket: tokenization-artifacts-dev, key: lambdas/trading-operations/1.0.0.zip }
+    handler: TradingOperations::TradingOperations.Function::Handler
+    memory_mb: 512
+    timeout_seconds: 29
+    uses_database: true
+    data_access: [idempotency-table, saga-table]
+  signer:
+    artifact: { bucket: tokenization-artifacts-dev, key: lambdas/stellar-signer/1.0.0.zip }
+    handler: StellarSigner::StellarSigner.Function::Handler
+    memory_mb: 512
+    timeout_seconds: 10
+
+database:
+  engine_version: "16.6"
+  instance_class: t4g.micro
+  allocated_storage_gb: 20
+  multi_az: false
+  backup_retention_days: 1
+
+kyc_providers: [provider-a]
+
+cognito:
+  domain_prefix: dev-tokenization-portal
+  resource_server:
+    identifier: tokenization-api
+    scopes:
+      - { name: portal, description: Portal access to the tokenization API }
+
+portal:
+  # Placeholder: replace with the origin of the Amplify branch created by hand.
+  origin: https://main.d000000000000.amplifyapp.com
+  scopes: [portal]
+  local_dev_callback_urls: ["http://localhost:5173/callback"]
+
+api:
+  throttling_rate_limit: 50
+  throttling_burst_limit: 100
+  route_scopes:
+    collateral-identity: [tokenization-api/portal]
+    sagas-payments: [tokenization-api/portal]
+    reports: [tokenization-api/portal]
+    stellar-kyc: [tokenization-api/portal]
+    trading-operations: [tokenization-api/portal]
+
+events:
+  archive_retention_days: 30
+
+queues:
+  - { name: payments, consumer: sagas-payments, max_receive_count: 5, visibility_timeout_seconds: 180 }
+
+rules:
+  - name: payment-requested
+    event_pattern: { source: [tokenization.trading], detail-type: [PaymentRequested] }
+    target: { type: queue, queue: payments }
+
+saga:
+  definition_file: config/statemachines/tokenization-saga.asl.json
+
+scheduler:
+  targets:
+    - { type: state-machine }
+
+observability:
+  log_retention_days: 14
+  alarm_emails: ["ops@example.com"]  # placeholder: the operator replaces it
+  access_log_expiration_days: 90
+
+cicd:
+  github_owner: example-owner  # placeholder: the GitHub organization or user that owns this repository
+  github_repo: tokenization-infra

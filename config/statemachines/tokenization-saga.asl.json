@@ -1,0 +1,111 @@
+{
+  "Comment": "Minimal tokenization saga: reserve payment, execute the Stellar operation, record the trade. Any failure releases the reservation.",
+  "StartAt": "ReservePayment",
+  "States": {
+    "ReservePayment": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${SagasPaymentsFunctionArn}",
+        "Payload": {
+          "action": "ReservePayment",
+          "input.$": "$"
+        }
+      },
+      "ResultPath": "$.reservation",
+      "ResultSelector": { "result.$": "$.Payload" },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "SagaFailed" }
+      ],
+      "Next": "ExecuteStellarOperation"
+    },
+    "ExecuteStellarOperation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StellarKycFunctionArn}",
+        "Payload": {
+          "action": "ExecuteStellarOperation",
+          "input.$": "$"
+        }
+      },
+      "ResultPath": "$.stellar",
+      "ResultSelector": { "result.$": "$.Payload" },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CompensatePayment" }
+      ],
+      "Next": "RecordTrade"
+    },
+    "RecordTrade": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TradingOperationsFunctionArn}",
+        "Payload": {
+          "action": "RecordTrade",
+          "input.$": "$"
+        }
+      },
+      "ResultPath": "$.trade",
+      "ResultSelector": { "result.$": "$.Payload" },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CompensatePayment" }
+      ],
+      "Next": "SagaSucceeded"
+    },
+    "CompensatePayment": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${SagasPaymentsFunctionArn}",
+        "Payload": {
+          "action": "ReleasePayment",
+          "input.$": "$"
+        }
+      },
+      "ResultPath": "$.compensation",
+      "ResultSelector": { "result.$": "$.Payload" },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "SagaFailed"
+    },
+    "SagaSucceeded": {
+      "Type": "Succeed"
+    },
+    "SagaFailed": {
+      "Type": "Fail",
+      "Error": "TokenizationSagaFailed",
+      "Cause": "A saga step failed. Compensation ran where a payment had been reserved."
+    }
+  }
+}

@@ -1,1 +1,20 @@
 .devbox/
+
+# CDK
+cdk.out/
+cdk.context.json
+
+# Node (CDK CLI only)
+node_modules/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/

@@ -1,8 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.21.0/.schema/devbox.schema.json",
   "packages": [
-    "python@latest",
+    "python@3.12",
     "uv@latest",
+    "nodejs@24",
     "git@latest",
     "awscli2@latest",
     "jq@latest",
@@ -16,7 +17,13 @@
     ],
     "scripts": {
       "test": [
-        "echo \"Error: no test specified\" && exit 1"
+        "uv run pytest"
+      ],
+      "lint": [
+        "uv run ruff check . && uv run ruff format --check . && uv run mypy"
+      ],
+      "synth": [
+        "npx cdk synth -c stage=dev"
       ]
     }
   }

@@ -1,0 +1,117 @@
+name: deploy
+
+# Deploys the dev stage on every push to main: the same checks as the pull request
+# workflow, then the account guard, then `cdk deploy --all`. The Bootstrap_Stack is
+# not part of app.py, so --all never deploys it.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
+
+env:
+  STAGE: dev
+
+jobs:
+  deploy:
+    name: Check and deploy dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: dev
+    # Queue deployments instead of cancelling one that is already running.
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.4.0
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install the CDK CLI
+        run: npm ci
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Mypy
+        run: uv run mypy
+
+      - name: Pytest
+        run: uv run pytest
+
+      - name: Actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "${ACTIONLINT_VERSION}"
+          ./actionlint -color
+
+      - name: CDK synth (runs cdk-nag)
+        run: npx cdk synth -c "stage=${STAGE}"
+
+      - name: Read the AWS account and region from the stage config
+        id: config
+        run: |
+          account="$(yq -r '.account' "config/stages/${STAGE}.yaml")"
+          region="$(yq -r '.region' "config/stages/${STAGE}.yaml")"
+          if [[ ! "${account}" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::config/stages/${STAGE}.yaml has no valid 12-digit account (got '${account}')."
+            exit 1
+          fi
+          if [[ -z "${region}" || "${region}" == "null" ]]; then
+            echo "::error::config/stages/${STAGE}.yaml has no region."
+            exit 1
+          fi
+          {
+            echo "account=${account}"
+            echo "region=${region}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Assume the Deploy_Role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ steps.config.outputs.region }}
+          role-session-name: deploy-${{ github.run_id }}
+
+      # Fails when the credentials belong to a different account than the stage config.
+      # The placeholder account 000000000000 never matches a real caller identity, so
+      # this also blocks a deploy before the operator sets the real account.
+      - name: Check the caller account matches the stage config
+        env:
+          EXPECTED_ACCOUNT: ${{ steps.config.outputs.account }}
+        run: |
+          actual="$(aws sts get-caller-identity --query Account --output text)"
+          if [[ "${actual}" != "${EXPECTED_ACCOUNT}" ]]; then
+            echo "::error::The credentials are for account ${actual}, but config/stages/${STAGE}.yaml expects ${EXPECTED_ACCOUNT}. Nothing was deployed."
+            exit 1
+          fi
+          echo "Deploying to account ${actual}."
+
+      - name: CDK deploy
+        run: npx cdk deploy --all -c "stage=${STAGE}" --require-approval never

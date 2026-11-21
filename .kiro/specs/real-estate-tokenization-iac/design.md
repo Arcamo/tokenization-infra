@@ -2,7 +2,7 @@
 
 ## Overview
 
-This design covers spec 1 of the "Tokenización Inmobiliaria" MVP infrastructure: an AWS CDK v2 application in Python that deploys the core backend and one Amplify single-page application (the Portal_App) into a single AWS account. The repository contains infrastructure only. The .NET Lambda zip packages come from a separate application repository and are referenced through Artifact_References in Stage_Config.
+This design covers spec 1 of the "Tokenización Inmobiliaria" MVP infrastructure: an AWS CDK v2 application in Python that deploys the core backend, and the Cognito and API settings for one single-page application (the Portal_App), into a single AWS account. The Portal_App is an Amplify Hosting app created by hand (D4); this repository creates no Amplify resources. The repository contains infrastructure only. The .NET Lambda zip packages come from a separate application repository and are referenced through Artifact_References in Stage_Config.
 
 The design rests on four choices:
 
@@ -17,7 +17,6 @@ These facts were checked against current documentation. Sources are listed at th
 
 | Topic | Finding | Decision |
 |---|---|---|
-| Amplify Hosting | The Amplify L2 (`aws-cdk.aws-amplify-alpha`) is still experimental. L1 `CfnApp`, `CfnBranch` and `CfnDomain` are stable. | Use the L1 constructs behind a small local construct, `PortalApp`. |
 | RDS Proxy IAM auth | Clients authenticate to the proxy with IAM (`rds-db:connect` on `arn:aws:rds-db:<region>:<account>:dbuser:prx-<id>/<user>`). The proxy reaches the database with Secrets Manager credentials. | L2 `rds.DatabaseProxy` with `iam_auth=True` and `require_tls=True`. Each database-using role gets `proxy.grant_connect(role, app_user)`. End-to-end IAM to the database is not used. |
 | EventBridge Scheduler | `aws_cdk.aws_scheduler` (`ScheduleGroup`, `Schedule`) is stable. | Use the L2 `ScheduleGroup` and an explicit `iam.Role` as the execution role. |
 | Stellar signing key | KMS supports `ECC_NIST_EDWARDS25519` (Ed25519, sign/verify only). The CDK Python enum `kms.KeySpec.ECC_NIST_EDWARDS25519` exists. | Use `kms.Key(key_spec=KeySpec.ECC_NIST_EDWARDS25519, key_usage=KeyUsage.SIGN_VERIFY)`. No escape hatch is needed. |
@@ -47,7 +46,7 @@ These facts were checked against current documentation. Sources are listed at th
 - **D1: Deterministic names where a reference would create a cycle.** The Saga_State_Machine (messaging stack) needs Domain_Lambda ARNs, and the Domain_Lambdas (api-compute stack) need queue URLs and the state machine ARN. The state machine definition and its role policy use ARNs built from function names (`arn:{partition}:lambda:{region}:{account}:function:{stage}-{fn}`). Step Functions does not check that the function exists when it creates the machine. The Scheduler role policy, the Signing_Key policy (signer role ARN) and the Kyc_Secrets resource policies (Stellar_KYC role ARN) use the same technique.
 - **D2: Consumers import KMS keys by ARN.** Stacks other than `security` call `kms.Key.from_key_arn`. CDK then writes grants into the consumer role's identity policy and never edits the key policy in another stack, which would create a back-reference. The Data_Key policy declares the service principals that cannot use caller grants up front, each with `aws:SourceAccount`: `events.amazonaws.com` (rule targets and rule DLQs are encrypted SQS queues) and `cloudwatch.amazonaws.com` (alarm actions publish to the encrypted Alert_Topic).
 - **D3: The Api requires access tokens.** API Gateway checks `authorization_scopes` only on access tokens, so the Portal_App must send the Cognito access token, not the ID token. Requirement 5.3 needs scopes, so this follows from the requirements. It is recorded so the front-end team knows.
-- **D4: The Portal_App branch has its own stack.** The Api needs the User_Pool (authorizer) and the Portal_Origin (CORS), both from `identity-frontend`. The Portal_App needs the Api base URL (Requirement 4.11). One stack cannot hold both sides without a cycle. The `CfnApp`, which yields the Amplify default domain and therefore the Portal_Origin, stays in `identity-frontend` together with the app-level environment variables. A small `{stage}-portal-branch` stack, deployed after `api-compute`, holds the `CfnBranch` with the branch-level variable for the Api base URL, and the optional `CfnDomain`. Amplify merges app-level and branch-level variables. Requirement 1.11 lists this stack (decided, see O8).
+- **D4: The Portal_App is created by hand (decided).** Amplify Hosting apps are created and configured outside the IaC_App (assumption A8, Requirement 4.11): app, branch, SPA rewrite rule, repository connection, custom domain and environment variables. Stage_Config holds the resulting HTTPS origin in `portal.origin` (4.9, 4.10). Cognito callback and logout URLs and the Api CORS settings are derived from it. Because nothing in the IaC depends on an Amplify resource, there is no API/Amplify cycle and no portal branch stack. The `identity` stack publishes the Portal_Client ID and the hosted UI domain as Extension_Parameters (11.4), so operators copy them, the User_Pool ID and the Api base URL into the Portal_App environment variables. Order of operations: create the Amplify app and branch, record the origin in Stage_Config, deploy, then set the environment variables and redeploy the front end. If the origin changes (for example a custom domain is added), update `portal.origin` and redeploy, or sign-in redirects and CORS fail.
 - **D5: A dedicated database user.** Lambdas connect as `app_user`, not as the master user. The IaC generates the `app_user` secret and registers it with the Db_Proxy. The application repository's migrations create the PostgreSQL role. This is a documented post-deploy step.
 - **D6: Deny statements back up the exclusive grants.** Identity policies give `kms:Sign` only to the signer role, and `secretsmanager:GetSecretValue` on Kyc_Secrets only to the Stellar_KYC role. In addition, the Signing_Key policy denies `kms:Sign` to every principal whose `aws:PrincipalArn` is not the signer role, and each Kyc_Secret resource policy denies `GetSecretValue` to every principal except the Stellar_KYC role.
 - **D7: The Bootstrap_Stack has its own entry point.** `bootstrap_app.py` synthesizes only the Bootstrap_Stack. `app.py` never contains it, so `cdk deploy --all` in the Pipeline cannot deploy it (Requirement 13.3). An admin deploys it once with `npx cdk --app "uv run --frozen python bootstrap_app.py" deploy`. Requirement 1.11 states that the Bootstrap_Stack lives in a separate CDK app (decided).
@@ -69,9 +68,8 @@ flowchart LR
   NET["{stage}-network<br/>VPC, NAT, endpoints, SGs, flow logs"]
   DATA["{stage}-data<br/>RDS + Db_Proxy, DynamoDB, S3"]
   MSG["{stage}-messaging<br/>Event_Bus, queues + DLQs, rules, saga, Scheduler"]
-  IDF["{stage}-identity-frontend<br/>User_Pool, Portal_Client, Portal_App (CfnApp)"]
+  IDF["{stage}-identity<br/>User_Pool, Portal_Client, hosted UI domain"]
   API["{stage}-api-compute<br/>Api, 5 Domain_Lambdas, Signer_Lambda, ESMs"]
-  BR["{stage}-portal-branch<br/>CfnBranch, CfnDomain"]
   OBS["{stage}-observability<br/>Alert_Topic, DLQ alarms"]
   SEC --> DATA
   NET --> DATA
@@ -81,19 +79,17 @@ flowchart LR
   DATA --> API
   MSG --> API
   IDF --> API
-  IDF --> BR
-  API --> BR
   SEC --> OBS
   MSG --> OBS
 ```
 
-Arrows point from producer to consumer. `network` and `identity-frontend` have no dependencies. `messaging` does not depend on `api-compute` (D1). Each stack publishes the Extension_Parameters for the resources it owns, so a later spec reads them without touching spec 1 stacks.
+Arrows point from producer to consumer. `network` and `identity` have no dependencies. `messaging` does not depend on `api-compute` (D1). Each stack publishes the Extension_Parameters for the resources it owns, so a later spec reads them without touching spec 1 stacks.
 
 ### Request flow
 
 ```mermaid
 sequenceDiagram
-  participant U as Browser (Portal_App)
+  participant U as Browser (Portal_App, Amplify app created by hand)
   participant C as Cognito hosted UI
   participant G as Api (REST, regional)
   participant L as Stellar_KYC Lambda
@@ -128,18 +124,16 @@ src/tokenization_infra/
     config.py               # pydantic models, parse_stage_config, load_stage, resolve_stage
     errors.py               # ConfigError, UnknownStageError, format_loc
     naming.py               # resource_name, function_name, role_name
-    urls.py                 # portal_origin, callback_urls, logout_urls, cors_origins, origin_of
+    urls.py                 # origin_of, is_https_origin, callback_urls, logout_urls, cors_origins
     permissions.py          # Capability, permission_profile
     saga.py                 # referenced_functions, substitute
     parameters.py           # extension_parameter_names
     oidc.py                 # oidc_subjects
-    spa.py                  # SPA_REWRITE_SOURCE, is_spa_route
     custom_resources.py     # ALLOWLIST, find_custom_resources(template)
   constructs/               # reusable CDK constructs (absolute imports only)
     domain_function.py      # role + LogGroup + lambda.Function
     queue_with_dlq.py
     secure_bucket.py
-    portal_app.py           # CfnApp wrapper
   stacks/                   # one module per stack in the graph
   nag/acknowledgements.py   # every cdk-nag acknowledgement with its reason
 tests/
@@ -189,10 +183,9 @@ def build_app(app: cdk.App, cfg: StageConfig) -> StackSet:
     network = NetworkStack(app, f"{cfg.stage}-network", cfg=cfg, env=env)
     data = DataStack(app, f"{cfg.stage}-data", cfg=cfg, network=network, security=security, env=env)
     messaging = MessagingStack(app, f"{cfg.stage}-messaging", cfg=cfg, security=security, env=env)
-    identity = IdentityFrontendStack(app, f"{cfg.stage}-identity-frontend", cfg=cfg, env=env)
+    identity = IdentityStack(app, f"{cfg.stage}-identity", cfg=cfg, env=env)
     api = ApiComputeStack(app, f"{cfg.stage}-api-compute", cfg=cfg, network=network,
                           security=security, data=data, messaging=messaging, identity=identity, env=env)
-    branch = PortalBranchStack(app, f"{cfg.stage}-portal-branch", cfg=cfg, identity=identity, api=api, env=env)
     observability = ObservabilityStack(app, f"{cfg.stage}-observability", cfg=cfg,
                                        security=security, messaging=messaging, env=env)
     for key, value in {"project": cfg.project, "stage": cfg.stage, "managed-by": "cdk"}.items():
@@ -225,7 +218,7 @@ def function_name(stage: str, fn: FunctionId) -> str: ...   # "{stage}-{fn}"
 def role_name(stage: str, fn: FunctionId) -> str: ...       # "{stage}-{fn}-role"
 
 # core/urls.py
-def portal_origin(*, branch: str, default_domain: str, custom_domain: CustomDomain | None) -> str: ...
+def is_https_origin(url: str) -> bool: ...                # https://host[:port] with no path, query or fragment
 def origin_of(url: str) -> str: ...                         # scheme://host[:port]
 def callback_urls(origin: str, path: str, local_dev_urls: Sequence[str]) -> list[str]: ...
 def logout_urls(origin: str, path: str, local_dev_urls: Sequence[str]) -> list[str]: ...
@@ -243,10 +236,6 @@ def extension_parameter_names(project: str, stage: str) -> Mapping[ExtensionKey,
 
 # core/oidc.py
 def oidc_subjects(owner: str, repo: str, stage: str, branch: str) -> OidcSubjects: ...  # .deploy, .pull_request
-
-# core/spa.py
-SPA_REWRITE_SOURCE: str      # Amplify regex "</^[^.]+$|\\.(?!(css|gif|ico|jpg|jpeg|js|json|map|png|svg|txt|webp|woff|woff2|ttf)$)([^.]+$)/>"
-def is_spa_route(path: str) -> bool: ...    # applies the inner regex with Python re
 
 # core/custom_resources.py
 ALLOWLIST: tuple[AllowlistEntry, ...] = ()  # entries: (stack, logical-id prefix, reason >= 20 chars)
@@ -332,7 +321,7 @@ Calls between Lambdas (Stellar_KYC to Signer) and to Cognito leave through the N
 - Extension_Parameters: `events/bus-name`, `events/bus-arn`.
 - Outputs: `bus`, `queues: dict[str, QueueWithDlq]`, `all_dlqs` (work-queue DLQs and rule-target DLQs), `saga`.
 
-### IdentityFrontendStack (`{stage}-identity-frontend`)
+### IdentityStack (`{stage}-identity`)
 
 - **User_Pool**: `cognito.UserPool(user_pool_name=f"{stage}-users")`
   - `sign_in_aliases=SignInAliases(email=True)`, `self_sign_up_enabled=True`, `auto_verify=AutoVerifiedAttrs(email=True)`
@@ -341,19 +330,14 @@ Calls between Lambdas (Stellar_KYC to Signer) and to Cognito leave through the N
   - `deletion_protection` and the removal policy follow Stage_Config
 - **Groups**: one `cognito.CfnUserPoolGroup` per `cognito.groups[i]` (default `investor`, `seller`, `backoffice`).
 - **Resource_Server**: `user_pool.add_resource_server(identifier=cognito.resource_server.identifier, scopes=[ResourceServerScope(...)...])`.
-- **Hosted UI domain**: `user_pool.add_domain(cognito_domain=CognitoDomainOptions(domain_prefix=cfg.cognito.domain_prefix))`. The prefix is used as given; config validation has already checked that it starts with `{stage}-` (D11).
-- **Portal_App** (`PortalApp` construct): `amplify.CfnApp`
-  - `name=f"{stage}-portal"`, `platform="WEB"`
-  - `custom_rules=[{source: SPA_REWRITE_SOURCE, target: "/index.html", status: "200"}]`
-  - `environment_variables`, each name with `portal.env_prefix` (default `APP_`, because Amplify reserves the `AWS_` prefix): `USER_POOL_ID`, `USER_POOL_CLIENT_ID`, `COGNITO_DOMAIN` (`{prefix}.auth.{region}.amazoncognito.com`), `REGION`
-  - When `portal.repository` is set: `repository` and `access_token=SecretValue.secrets_manager(portal.access_token_secret_name).unsafe_unwrap()`. This is a CloudFormation dynamic reference, so the token is never written into the template in plain text.
-- **Portal_Origin**: `portal_origin(branch=portal.branch, default_domain=app.attr_default_domain, custom_domain=portal.custom_domain)`.
+- **Hosted UI domain**: `user_pool.add_domain(cognito_domain=CognitoDomainOptions(domain_prefix=cfg.cognito.domain_prefix))`. The prefix is used as given; config validation has already checked that it starts with `{stage}-` (D11). The full domain is `{prefix}.auth.{region}.amazoncognito.com`.
+- **Portal_Origin**: `cfg.portal.origin`, validated at parse time (D4). No Amplify construct is created (4.11).
 - **Portal_Client**: `user_pool.add_client("PortalClient", ...)`
   - `generate_secret=False`, `o_auth=OAuthSettings(flows=OAuthFlows(authorization_code_grant=True), scopes=[OPENID, EMAIL, PROFILE, *resource server scopes from portal.scopes], callback_urls=callback_urls(...), logout_urls=logout_urls(...))`
   - `auth_flows` with every flow off, so the only explicit flow is `ALLOW_REFRESH_TOKEN_AUTH`. A test asserts the synthesized `ExplicitAuthFlows`. If the L2 cannot produce exactly that list, a property override sets it and cdk-nag gets an acknowledgement.
   - `prevent_user_existence_errors=True`
-- Extension_Parameters: `identity/user-pool-id`, `identity/user-pool-arn`, `identity/resource-server-identifier`.
-- Outputs: `user_pool`, `resource_server`, `portal_client`, `portal_app`, `portal_origin`, `cors_origins`.
+- Extension_Parameters: `identity/user-pool-id`, `identity/user-pool-arn`, `identity/resource-server-identifier`, `identity/portal-client-id`, `identity/hosted-ui-domain`.
+- Outputs: `user_pool`, `resource_server`, `portal_client`, `portal_origin`, `cors_origins`.
 
 ### ApiComputeStack (`{stage}-api-compute`)
 
@@ -389,11 +373,6 @@ Calls between Lambdas (Stellar_KYC to Signer) and to Cognito leave through the N
 - **KYC_Webhook_Routes**: `/webhooks/kyc/{provider}` `POST` to Stellar_KYC with `authorization_type=NONE`, the `provider` path parameter required, and the body validator. The Lambda verifies the provider's webhook signature with the webhook-signing secret (application code). cdk-nag APIG4 and COG4 are acknowledged on this method only.
 - Extension_Parameters: `api/id`, `api/root-resource-id`, `api/base-url`.
 
-### PortalBranchStack (`{stage}-portal-branch`)
-
-- `amplify.CfnBranch(app_id=identity.portal_app.attr_app_id, branch_name=portal.branch, stage="DEVELOPMENT" or "PRODUCTION" per config, environment_variables=[{name: f"{prefix}API_BASE_URL", value: api.url}])`. When the app has no repository, the branch still exists and accepts manual or zip deployments from the application repository.
-- When `portal.custom_domain` is set: `amplify.CfnDomain(app_id=..., domain_name=..., sub_domain_settings=[{prefix, branch_name}], enable_auto_sub_domain=False)`, which depends on the branch.
-
 ### ObservabilityStack (`{stage}-observability`)
 
 - **Alert_Topic**: `sns.Topic(topic_name=f"{stage}-alarms", master_key=data_key, enforce_ssl=True)` and one `EmailSubscription` per `observability.alarm_emails[i]`.
@@ -416,6 +395,8 @@ Calls between Lambdas (Stellar_KYC to Signer) and to Cognito leave through the N
 | USER_POOL_ID | `identity/user-pool-id` | User_Pool id | 11.4 |
 | USER_POOL_ARN | `identity/user-pool-arn` | User_Pool ARN | 11.4 |
 | RESOURCE_SERVER_ID | `identity/resource-server-identifier` | identifier | 11.4 |
+| PORTAL_CLIENT_ID | `identity/portal-client-id` | Portal_Client id | 11.4 |
+| HOSTED_UI_DOMAIN | `identity/hosted-ui-domain` | `{prefix}.auth.{region}.amazoncognito.com` | 11.4 |
 | DATA_KEY_ARN | `keys/data-key-arn` | key ARN | 11.5 |
 | SIGNING_KEY_ARN | `keys/signing-key-arn` | key ARN | 11.5 |
 | EVENT_BUS_NAME | `events/bus-name` | bus name | 11.6 |
@@ -508,21 +489,12 @@ class CognitoConfig(StrictModel):
     groups: list[Kebab] = ["investor", "seller", "backoffice"]
     resource_server: ResourceServerConfig  # identifier: Kebab, scopes: list[ScopeConfig] (min 1)
 
-class CustomDomain(StrictModel):
-    domain_name: str
-    prefix: str = ""                       # "" means the apex domain
-
 class PortalConfig(StrictModel):
-    branch: Kebab = "main"
-    stage: Literal["DEVELOPMENT", "PRODUCTION"] = "DEVELOPMENT"
-    repository: HttpUrl | None = None      # https://github.com/<owner>/<repo>
-    access_token_secret_name: str | None = None
+    origin: str                            # https://host[:port], no path (4.9, 4.10): Amplify branch domain or custom domain
     callback_path: str = "/callback"
     logout_path: str = "/"
     scopes: list[str] = []                 # resource server scope names for the Portal_Client
     local_dev_callback_urls: list[AnyHttpUrl] = []   # http://localhost:<port>/... only
-    custom_domain: CustomDomain | None = None
-    env_prefix: str = "APP_"
 
 class ApiConfig(StrictModel):
     throttling_rate_limit: Annotated[float, Field(gt=0)]
@@ -565,7 +537,7 @@ class StageConfig(StrictModel):
     database: DatabaseConfig
     kyc_providers: Annotated[list[Kebab], Field(min_length=1)]
     cognito: CognitoConfig
-    portal: PortalConfig = PortalConfig()
+    portal: PortalConfig                              # origin is required
     api: ApiConfig
     events: EventsConfig                              # archive_retention_days >= 1
     queues: list[QueueConfig] = []
@@ -583,7 +555,7 @@ class StageConfig(StrictModel):
 - Queue names and rule names are unique. `rules[i].target.queue` and `scheduler.targets[i].queue` name defined queues. The scheduler cannot target the Signer (the type already excludes it, and the check also covers raw YAML).
 - `queues[i].visibility_timeout_seconds >= functions[consumer].timeout_seconds`. AWS rejects the event source mapping otherwise.
 - Every `api.route_scopes` value and every `portal.scopes` entry refers to a scope defined in `cognito.resource_server`.
-- `portal.repository` and `portal.access_token_secret_name` are both set or both unset. `local_dev_callback_urls` use `http://localhost` or `http://127.0.0.1`.
+- `portal.origin` passes `core.urls.is_https_origin` (4.10). `local_dev_callback_urls` use `http://localhost` or `http://127.0.0.1`.
 - `cognito.domain_prefix` starts with `{stage}-` (D11, Requirement 1.9) and does not contain `aws`, `amazon` or `cognito`.
 - `saga.definition_file` exists, is valid JSON, and uses only allowed placeholders (checked with `core.saga.referenced_functions`).
 
@@ -620,6 +592,7 @@ cognito:
     identifier: tokenization-api
     scopes: [{ name: portal, description: Portal access to the tokenization API }]
 portal:
+  origin: https://main.d000000000000.amplifyapp.com   # placeholder: the origin of the Amplify branch created by hand
   scopes: [portal]
   local_dev_callback_urls: ["http://localhost:5173/callback"]
 api:
@@ -669,7 +642,8 @@ If the key stays the same and no `version` is set, CloudFormation does not notic
 | Custom resource outside the allowlist | `tests/test_custom_resources.py` fails and names the stack and logical id. |
 | Artifact object missing at deploy | CloudFormation fails the Lambda resource and rolls the stack back. The README pre-deploy checklist runs `aws s3api head-object` for every Artifact_Reference. |
 | OIDC provider already exists | Creation fails. Set `cicd.create_oidc_provider: false` to import the provider. |
-| Amplify repository token secret missing | The dynamic reference fails at deploy time. Config validation requires the secret name with the repository, and the README covers creating the secret. |
+| `portal.origin` is not an HTTPS origin | `ConfigError` at path `portal.origin`. |
+| Portal_App domain changed by hand | Sign-in redirects and CORS fail until `portal.origin` is updated and the stacks are redeployed. The README covers this. |
 | Deleting a `DESTROY` stage | KMS keys are always retained (3.7). Non-empty buckets block stack deletion because `auto_delete_objects` is not used. The README describes emptying them first. |
 | Runtime failures | Messages that fail `max_receive_count` times move to the DLQ, and rule delivery failures go to the rule DLQs. DLQ alarms notify the Alert_Topic on `ALARM` and `OK`. |
 
@@ -683,7 +657,7 @@ The properties cover only the pure `tokenization_infra.core` package. The synthe
 
 - 1.2 and 1.7 form one parse property.
 - 1.4 and 1.5 form one stage-resolution property.
-- 1.6, 2.3 and 12.8 form one field-path error property. The NAT count range is one case of an out-of-range value.
+- 1.6, 2.3, 4.10 and 12.8 form one field-path error property. The NAT count range is one case of an out-of-range value.
 - 3.3, 3.4, 3.6 and 6.7 form one exclusivity property.
 - 6.6, 7.5, 9.4, 9.8 (consumer side) and 9.10 form one property about shared and conditional capabilities.
 - 4.5, 5.3, 9.7, 9.8 (reference side) and 9.9 form one reference-validation property.
@@ -707,7 +681,7 @@ For any registry of valid raw configs keyed by stage name and any stage name, `r
 
 For any valid raw Stage_Config and any required field path in it, deleting that field, or replacing its value with one of the wrong type or outside its allowed range (including any `network.nat_gateways` value below 1 or above 2), makes `parse_stage_config` raise `ConfigError`, and the message contains the dotted path of that field.
 
-**Validates: Requirements 1.6, 2.3, 12.8**
+**Validates: Requirements 1.6, 2.3, 4.10, 12.8**
 
 ### Property 4: Generated names carry the stage prefix and meet service limits
 
@@ -746,28 +720,22 @@ For any ASL JSON document whose `Resource` fields use a subset S of the allowed 
 
 ### Property 9: Portal URLs and CORS origins are exactly the derived set
 
-For any branch name, default domain, optional custom domain, callback path, logout path and list of local development URLs:
+For any HTTPS origin, callback path, logout path and list of local development URLs:
 
-- `portal_origin` is `https://<prefix>.<domain>` (or `https://<domain>` for an empty prefix) when a custom domain is given, and `https://<branch>.<default_domain>` otherwise.
-- `callback_urls` returns exactly `{portal_origin + callback_path}` ∪ the local URLs, and `logout_urls` returns exactly `{portal_origin + logout_path}` ∪ `{origin_of(u) + logout_path}` for the local URLs.
-- `cors_origins` returns exactly `{portal_origin}` ∪ `{origin_of(u)}` for the local URLs.
+- `is_https_origin` is true for the origin, and false for the same value with a path, query, fragment or `http` scheme added.
+- `callback_urls` returns exactly `{origin + callback_path}` ∪ the local URLs, and `logout_urls` returns exactly `{origin + logout_path}` ∪ `{origin_of(u) + logout_path}` for the local URLs.
+- `cors_origins` returns exactly `{origin}` ∪ `{origin_of(u)}` for the local URLs.
 - No result contains `*` or duplicates, and permuting the local URL list yields the same set.
 
-**Validates: Requirements 4.6, 4.7, 5.9**
+**Validates: Requirements 4.6, 4.7, 4.10, 5.9**
 
-### Property 10: The SPA rewrite matches exactly the non-static paths
-
-For any URL path, `is_spa_route(path)` is false when the last path segment ends in one of the listed static file extensions and true when the last segment has no extension.
-
-**Validates: Requirements 4.10**
-
-### Property 11: Extension parameter names are complete, unique and correctly prefixed
+### Property 10: Extension parameter names are complete, unique and correctly prefixed
 
 For any valid project name and stage name, `extension_parameter_names(project, stage)` returns one name for every `ExtensionKey`. Every name starts with `/{project}/{stage}/`, all names are distinct, and every name is a valid SSM parameter name (only `a-zA-Z0-9_.-/`, at most 1011 characters).
 
 **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7**
 
-### Property 12: OIDC subjects are bound to repository, stage and branch
+### Property 11: OIDC subjects are bound to repository, stage and branch
 
 For any GitHub owner and repository name that follow GitHub naming rules, any branch name and any stage name, `oidc_subjects` returns a deploy subject equal to `repo:{owner}/{repo}:environment:{stage}:ref:refs/heads/{branch}` with no `*` or `?`, and a pull-request subject that starts with `repo:{owner}/{repo}:pull_request:` and contains a wildcard only in its last segment.
 
@@ -779,24 +747,24 @@ For any GitHub owner and repository name that follow GitHub naming rules, any br
 
 - `uv run pytest` runs every suite once. There is no watch mode.
 - Hypothesis drives the property tests. `tests/conftest.py` registers a `ci` profile with `max_examples=100` and `deadline=None`, and loads it by default. Each property test has a docstring tag, for example `Feature: real-estate-tokenization-iac, Property 8: Saga substitution is complete and matches the referenced functions`.
-- Strategies live in `tests/core/strategies.py`: `valid_raw_configs()` (built field by field from the model constraints), `stage_names()`, `asl_documents(subset)`, `local_dev_urls()`, `url_paths()` and `github_repos()`. Edge cases come from the strategies rather than separate tests: empty queue, rule and scheduler lists, maximum-length names, `reserved_concurrency=None`, custom domain with and without prefix, and an empty local URL list.
+- Strategies live in `tests/core/strategies.py`: `valid_raw_configs()` (built field by field from the model constraints), `stage_names()`, `asl_documents(subset)`, `local_dev_urls()`, `https_origins()` and `github_repos()`. Edge cases come from the strategies rather than separate tests: empty queue, rule and scheduler lists, maximum-length names, `reserved_concurrency=None`, origins with and without a port, and an empty local URL list.
 - `aws_cdk.assertions` (`Template`, `Match`, `Annotations`) runs the stack tests.
 
 ### Property tests (`tests/core/test_*_properties.py`)
 
-There is one hypothesis test per property (Properties 1 to 12).
+There is one hypothesis test per property (Properties 1 to 11).
 
 ### Assertion tests (`tests/stacks/`)
 
-A session-scoped fixture synthesizes the app once per variant: dev, dev with `removal_policy: RETAIN`, dev with `nat_gateways: 2` and another region (for example `eu-west-1`), and dev with a custom domain and a repository. Lambda code comes from S3 references and there are no assets, so synthesis needs no Docker and no AWS credentials.
+A session-scoped fixture synthesizes the app once per variant: dev, dev with `removal_policy: RETAIN`, dev with `nat_gateways: 2` and another region (for example `eu-west-1`). Lambda code comes from S3 references and there are no assets, so synthesis needs no Docker and no AWS credentials.
 
 | Area | Example assertions |
 |---|---|
-| App (1.3, 1.8 to 1.11, 1.13) | The eight stack ids exist. Every stack's region equals the variant region. Every resource with `Tags` has `project`, `stage` and `managed-by=cdk`. Every stack name and explicit name property contains the stage as a prefix or path segment, except the names exempted by Requirement 1.9. `cdk.json` has `restrictDefaultSecurityGroup: false`. |
+| App (1.3, 1.8 to 1.11, 1.13) | The seven stack ids exist. Every stack's region equals the variant region. Every resource with `Tags` has `project`, `stage` and `managed-by=cdk`. Every stack name and explicit name property contains the stage as a prefix or path segment, except the names exempted by Requirement 1.9. `cdk.json` has `restrictDefaultSecurityGroup: false`. |
 | Network (2.x) | Six subnets. NAT count per variant. Private default routes point to a NAT. Two gateway endpoints and the eight interface endpoint service names. Exact security group rules. A flow log with `TrafficType: ALL` and a log group with retention. |
 | Security (3.x) | Rotation on the Data_Key. `KeySpec: ECC_NIST_EDWARDS25519` and `KeyUsage: SIGN_VERIFY`. `DeletionPolicy: Retain` on both keys in both removal variants. The Deny statements. Kyc_Secrets with `KmsKeyId` and no `GenerateSecretString`. |
 | Exclusive grants (3.3, 3.4, 3.6, 6.7, 12.3) | A scan of every IAM policy in every stack: `kms:Sign` only in the signer role policy, `kms:GetPublicKey` only in the signer and Stellar_KYC policies, `GetSecretValue` on Kyc_Secrets only in the Stellar_KYC policy, and `lambda:InvokeFunction` on the Signer only in the Stellar_KYC policy. |
-| Identity and front end (4.x, 12.4) | User pool properties, groups, resource server scopes, client flows, scopes, callback and logout URLs, `ExplicitAuthFlows`, domain prefix. Exactly one `AWS::Amplify::App` across all stacks, with the rewrite rule and environment variables. The branch and its `API_BASE_URL`. Repository and domain only in the matching variant. |
+| Identity (4.x, 12.4) | User pool properties, groups, resource server scopes, client flows, scopes, callback and logout URLs derived from `portal.origin`, `ExplicitAuthFlows`, domain prefix. No `AWS::Amplify::*` resource in any stack of any variant. |
 | Api (5.x) | REGIONAL endpoint. Every non-`OPTIONS` method uses `COGNITO_USER_POOLS` with the configured scopes, except `POST /webhooks/kyc/{provider}`. Five base paths with `AWS_PROXY` integrations. Access log, tracing and throttling on the stage. The execution log group with retention, and the stage depending on it. Gateway responses with the CORS header set to the Portal_Origin only. |
 | Compute (6.x, 12.2) | Six functions with runtime, handler, S3 code, memory, timeout and reserved concurrency from config. `VpcConfig.SubnetIds` contains only private subnets, plus the Lambda security group. `TracingConfig: Active`. Six distinct roles. Each function's environment keys match the resources in its permission profile. One log group per function with retention. |
 | Data (7.x, 8.x, 12.2) | Database in isolated subnets with `KmsKeyId` and config values. Generated secrets. Proxy with IAM auth `REQUIRED` and `RequireTLS`. `DeletionProtection` only in the RETAIN variant. `rds-db:connect` only for database users. Table settings. Every `AWS::S3::Bucket` has all four Block Public Access flags. TLS-deny policies, access logging and lifecycle rule. |
@@ -844,7 +812,7 @@ Pricing was not computed. Use the AWS Pricing Calculator before the first deploy
   - 1 NAT gateway, plus data processing
   - 8 interface endpoints × 2 AZs, likely the largest fixed item in dev
   - RDS `db.t4g.micro` Single-AZ, plus RDS Proxy (billed per vCPU of the underlying instance, with a minimum)
-- **Usage-based:** Lambda, API Gateway, DynamoDB on-demand, S3, Step Functions state transitions, EventBridge events and archive storage, SQS, KMS requests and 2 keys per month, Secrets Manager per secret per month, CloudWatch Logs ingestion and storage, CloudWatch alarms, X-Ray traces, Amplify build minutes and hosting.
+- **Usage-based:** Lambda, API Gateway, DynamoDB on-demand, S3, Step Functions state transitions, EventBridge events and archive storage, SQS, KMS requests and 2 keys per month, Secrets Manager per secret per month, CloudWatch Logs ingestion and storage, CloudWatch alarms, X-Ray traces. Amplify build minutes and hosting are billed to the hand-made Portal_App, outside this stack set.
 - **Levers within the requirements:** keep `nat_gateways: 1` and short log retention in dev. Putting interface endpoints in a single AZ would need a requirement change.
 
 ## Risks and Open Items
@@ -858,7 +826,7 @@ Items marked **Decided** were approved by the user. They stay listed so the reas
 - **O5: Log group encryption (D9). Decided:** default CloudWatch Logs encryption. The saga log group stores execution data. If that data must use the Data_Key, add the `logs.<region>.amazonaws.com` statement to the key policy and pass `encryption_key` to each log group.
 - **O6: PKCE is not enforced by Cognito. Decided:** Requirement 4.4 now reads "for use with PKCE by the Portal_App". The client allows only the code grant and has no secret. Using PKCE depends on the SPA library. The README states this.
 - **O7: CORS on gateway responses (5.10). Decided:** Requirement 5.10 allows only the Portal_Origin. A gateway response header holds one static value, so local development origins do not get CORS headers on API Gateway 4XX and 5XX errors. Echoing the request `Origin` would allow every origin.
-- **O8: Extra stack for the portal branch (D4). Decided:** Requirement 1.11 lists the `{stage}-portal-branch` stack, deployed after `api-compute`, which avoids a cycle with the Api.
+- **O8: Amplify apps are created by hand (D4). Decided:** the IaC creates no Amplify resources and has no portal branch stack. Stage_Config carries `portal.origin`, and the Portal_App environment variables are set by hand from the Extension_Parameters. This applies to the later Stellar agent UI and backoffice apps too.
 - **Other decided deviations:** explicit Availability Zones in Stage_Config (D8, Requirements 1.2 and 2.1), the separate `bootstrap_app.py` (D7, Requirement 1.11), the read-only Diff_Role for the pull-request `cdk diff` (Requirements 13.4 and 13.5), the pre-created API Gateway execution log group (D10, Requirement 10.1), and the Hosted UI domain prefix used as configured (D11). `network.nat_gateways` stays configurable from 1 to 2 with a dev default of 1.
 - **O9: The API Gateway account setting is account-wide.** `AWS::ApiGateway::Account` sets one CloudWatch role per account and region. If another stack in the account already manages it, the two conflict. In that case set `cloud_watch_role=False` and rely on the existing setting.
 - **O10: Lambda timeouts behind the Api.** REST API integrations time out at 29 seconds by default. A Domain_Lambda timeout above 29 seconds is allowed (SQS consumers may need it), and config validation prints a warning, not an error.
@@ -870,7 +838,6 @@ Items marked **Decided** were approved by the user. They stay listed so the reas
 - [CDK Python: aws_iam.OidcProviderNative](https://docs.aws.amazon.com/cdk/api/v2/python/aws_cdk.aws_iam/OidcProviderNative.html)
 - [CDK Python: aws_cdk.Validations](https://docs.aws.amazon.com/cdk/api/v2/python/aws_cdk/Validations.html)
 - [cdk-nag README (v3 usage and acknowledgements)](https://github.com/cdklabs/cdk-nag/blob/main/README.md) and [cdk-nag on PyPI (3.0.2)](https://pypi.org/project/cdk-nag/)
-- [CDK aws-amplify-alpha README (experimental)](https://docs.aws.amazon.com/cdk/api/v2/docs/aws-amplify-alpha-readme.html)
 - [Configuring IAM authentication for RDS Proxy](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy-iam-setup.html)
 - [CDK aws-scheduler README](https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.aws_scheduler-readme.html)
 - [KMS key specs](https://docs.aws.amazon.com/kms/latest/developerguide/symm-asymm-choose-key-spec.html)

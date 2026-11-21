@@ -1,0 +1,171 @@
+name: pr
+
+# Pull request checks for the dev stage: lint, types, tests, synth (with cdk-nag),
+# then a read-only `cdk diff` posted as a pull request comment.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
+
+env:
+  STAGE: dev
+
+jobs:
+  check:
+    name: Lint, test, synth and diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Pull requests from forks get no OIDC token and a read-only GITHUB_TOKEN.
+      IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.4.0
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install the CDK CLI
+        run: npm ci
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Mypy
+        run: uv run mypy
+
+      - name: Pytest
+        run: uv run pytest
+
+      - name: Actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "${ACTIONLINT_VERSION}"
+          ./actionlint -color
+
+      - name: CDK synth (runs cdk-nag)
+        run: npx cdk synth -c "stage=${STAGE}"
+
+      - name: Read the AWS region from the stage config
+        if: env.IS_FORK != 'true'
+        id: region
+        run: echo "region=$(yq -r '.region' "config/stages/${STAGE}.yaml")" >> "$GITHUB_OUTPUT"
+
+      - name: Assume the Diff_Role
+        if: env.IS_FORK != 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DIFF_ROLE_ARN }}
+          aws-region: ${{ steps.region.outputs.region }}
+          role-session-name: pr-diff-${{ github.run_id }}
+
+      # cdk diff exits 0 when there are differences and non-zero on errors. With
+      # pipefail, tee does not hide an error, so the step (and the job) fails.
+      - name: CDK diff
+        if: env.IS_FORK != 'true'
+        id: diff
+        run: npx cdk diff --all --no-change-set -c "stage=${STAGE}" 2>&1 | tee diff.txt
+
+      - name: Comment the diff on the pull request
+        # Runs after a failed diff too, so the comment shows the error. Skipped
+        # when the diff never started (an earlier step failed) or on cancellation.
+        if: ${{ !cancelled() && (env.IS_FORK == 'true' || steps.diff.outcome != 'skipped') }}
+        uses: actions/github-script@v9
+        env:
+          DIFF_OUTCOME: ${{ steps.diff.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = `<!-- cdk-diff:${process.env.STAGE} -->`;
+            const maxChars = 60000;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const isFork = process.env.IS_FORK === 'true';
+
+            let body;
+            if (isFork) {
+              body = [
+                marker,
+                `### CDK diff (${process.env.STAGE})`,
+                '',
+                'The diff was skipped. This pull request comes from a fork, so GitHub gives the workflow no OIDC token and no AWS credentials.',
+                '',
+                `[Workflow run](${runUrl})`,
+              ].join('\n');
+            } else {
+              let diff = '(no output)';
+              if (fs.existsSync('diff.txt')) {
+                // Strip ANSI colour codes.
+                diff = fs.readFileSync('diff.txt', 'utf8')
+                  .replace(/\u001b\[[0-9;]*m/g, '')
+                  .replace(/```/g, "'''")
+                  .trim() || '(no output)';
+              }
+              const failed = process.env.DIFF_OUTCOME === 'failure';
+              const header = [
+                marker,
+                `### CDK diff (${process.env.STAGE})${failed ? ': FAILED' : ''}`,
+                '',
+                failed ? '`cdk diff` exited with an error. The check fails until it is fixed.' : '',
+                '',
+                '```text',
+              ].join('\n');
+              const footer = ['```', '', `[Workflow run](${runUrl})`].join('\n');
+              const note = '\n... output truncated, see the workflow run log.\n';
+              const room = maxChars - header.length - footer.length - note.length - 4;
+              if (diff.length > room) {
+                diff = diff.slice(0, room) + note;
+              }
+              body = `${header}\n${diff}\n${footer}`;
+            }
+            body = body.slice(0, maxChars);
+
+            try {
+              const { owner, repo } = context.repo;
+              const issue_number = context.payload.pull_request.number;
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number, per_page: 100,
+              });
+              const existing = comments.find((c) => c.body && c.body.includes(marker));
+              if (existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              }
+            } catch (error) {
+              if (!isFork) {
+                throw error;
+              }
+              // Fork pull requests get a read-only token, so commenting can fail.
+              core.warning(`Could not post the comment on a fork pull request: ${error.message}`);
+              await core.summary.addRaw(body).write();
+            }
